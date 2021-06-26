@@ -1,0 +1,173 @@
+---
+title: "Projeto Integrador"
+author: "Rafael Uchoa"
+date: "6/25/2021"
+output:
+  html_document:
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, results=FALSE, message=FALSE, warning=FALSE, cache=TRUE)
+```
+
+## Setup
+
+Começamos carregando as bibliotecas e lendo os dados. Também transformamos caracteres em fatores e variável resposta em um dado numérico.
+
+```{r libraries}
+library(skimr)
+library(patchwork)
+library(tidyverse)
+library(xgboost)
+library(rsample)
+library(pdp)
+library(modeldata)
+library(yardstick)
+library(pROC)
+library(ranger)
+library(DT)
+library(vip)
+```
+
+```{r load_data}
+dados <- read.csv("bd.csv")
+
+dados <- dados %>% 
+  mutate_if(is.character, ~as.factor(.x))
+
+dados$nota <- ifelse(dados$nota == "alta", 1, 0)
+```
+
+## Train/Test split
+
+Em seguida, separamos o dataset em dados de treino e dados de teste:
+
+```{r split}
+set.seed(123)
+
+splits <- initial_split(dados, prop = .8, strata = nota)
+
+dados_tr   <- training(splits)
+dados_test <- testing(splits)
+```
+
+Agora podemos treinar nossos modelos.
+
+## Regressão Logística
+
+Salvamos o desempenho do nosso modelo em um tibble, que usaremos para comparar as métricas de performance entre os modelos.
+
+```{r log}
+fit_log <- glm(nota ~ ., 
+               data = dados_tr, family = "binomial")
+
+prob_log <- predict(fit_log, newdata = dados_test, type = "response")
+
+desempenho <- tibble(prob = prob_log, 
+                     classes = ifelse(dados_test$nota == 1, "alta", "baixa"), 
+                     metodo = "logística")
+```
+
+## Floresta Aleatória
+
+```{r rf}
+fit_rf <- ranger(nota ~ ., dados_tr, 
+                 probability=TRUE, importance='impurity')
+
+prob_rf <- predict(fit_rf, dados_test)$predictions[,1]
+
+desempenho <- desempenho %>% 
+  bind_rows(tibble(prob = prob_rf, 
+                   classes = ifelse(dados_test$nota == 1, "alta", "baixa"), 
+                   metodo = "random forest"))
+```
+
+## Boosting
+
+```{r xgb}
+fit_xgb <- xgboost(data=as.matrix(select(dados_tr, -nota)), label=dados_tr$nota, 
+                   nrounds = 1000, max_depth = 4, 
+                   eta = 0.1, nthread = 6, verbose = FALSE,
+                   objective="binary:logistic")
+
+prob_xgb <- predict(fit_xgb, newdata=as.matrix(select(dados_test, -nota)))
+
+desempenho <- desempenho %>%
+ bind_rows(tibble(prob = prob_xgb,
+                  classes = ifelse(dados_test$nota == 1, "alta", "baixa"),
+                  metodo = "xgb"))
+```
+
+## Importância das variáveis
+
+```{r vip}
+log_imp <- vip(fit_log)
+rf_imp <- vip(fit_rf)
+xgb_imp <- vip(fit_xgb)
+
+grid.arrange(log_imp, rf_imp, xgb_imp, ncol = 3)
+```
+
+Os modelos dão muita importância para a variável **B1_2**, nota do compromentimento da operadora em cumprir o que foi prometido.
+Em seguida, a variável mais importante é a **B1_1**, nota de facilidade de entendimento dos planos de serviço.
+
+Em particular, o modelo boosting dá importância significantemente maior para a variável B1_2.
+
+
+## Comparação de métricas
+
+Com nossos modelos treinados, precisamos comparar as métricas de performance entre os 3.
+
+Vamos começar com a àrea sob a curva ROC.
+
+```{r roc}
+desempenho_total <- desempenho %>%
+  group_split(metodo) %>%
+  set_names(c('Logistica', 'Random Forest', 'XGB')) %>%
+  map(~roc(response = .x$classes, predictor = .x$prob))
+
+desempenho_coords <- desempenho_total %>% 
+  map_dfr(coords, ret = 'all', x = c(seq(0.1, 0.9, 0.005)), .id = 'modelo') %>%
+  as_tibble()
+
+auc_data <- desempenho_total %>%
+  map_dbl('auc') %>%
+  enframe() %>%
+  mutate(y = c(.5, .55, .6),
+         lab = round(value, 4))
+
+desempenho_coords %>%
+  ggplot(aes(1-specificity, sensitivity, colour = modelo)) +
+  geom_step() +
+  geom_text(aes(x = .4, label = lab, y = y, colour = name), data = auc_data) +
+  theme_minimal()
+```
+
+Com o gráfico acima podemos ver que Random Forest e Boosting tem a mesma área sob a curva ROC.
+
+Precisamos olhar para outras métricas de performance:
+
+```{r d_table, results=TRUE, message=TRUE, warning=TRUE}
+DT::datatable(desempenho_coords)
+```
+
+Tentamos primeiro maximizar acurácia. Observamos que Random Forest com corte em torno de 0.5 tem a melhor acurácia. 
+Portanto, escolhemos Random Forest para o modelo final.
+
+Para decidir o corte, olhamos também para a taxa de verdadeiros positivos, obtendo assim a melhor predição para clientes satisfeitos.
+O corte em 0.495 tem a melhor taxa de verdadeiros positivos, com uma acurácia minimamente menor do que o melhor modelo (corte 0.515).
+
+## Modelo Final
+
+Nosso modelo final é o **Random Forest** com: 
+
+- AUC: 0.896
+- Corte: 0.495
+- Acurácia: 0.815
+- TPV: 0.801
+
+```{r modelo_final}
+rf_final <- ranger(nota ~ ., 
+             dados, probability = TRUE)
+```
